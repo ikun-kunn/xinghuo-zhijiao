@@ -22,11 +22,11 @@ import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import config, kb, storage, workflow
+from . import config, content_review, kb, storage, workflow
 from .mcp.jsonrpc import BizCode, ServiceError
 
 LOGGER = logging.getLogger(__name__)
@@ -241,6 +241,8 @@ def _classify(error: BaseException) -> ServiceError:
     """
     if isinstance(error, ServiceError):
         return error
+    if isinstance(error, content_review.ContentReviewBlocked):
+        return ServiceError(BizCode.CONTENT_BLOCKED, str(error))
     text = str(error)
     if "adp 模式未接入" in text or "LLM 未配置" in text:
         return ServiceError(BizCode.MODE_UNAVAILABLE, text)
@@ -311,6 +313,12 @@ def _atomic_drive(
                 storage.update_generation_status(
                     generation_id, "running", detail={"nodes": nodes_seen}
                 )
+            elif event.get("type") == "review":
+                storage.update_generation_status(
+                    generation_id,
+                    "running",
+                    detail={"content_review": event.get("report") or {}},
+                )
             elif event.get("type") == "done":
                 result = event.get("result") or {}
                 package = result.get("package") or {}
@@ -324,6 +332,7 @@ def _atomic_drive(
                         "elapsed_s": round(time.time() - started, 1),
                         "plan_text": plan_text,
                         "warnings": result.get("rural_warnings") or [],
+                        "content_review": result.get("content_review") or {},
                     },
                 )
                 _audit("generate.done", generation_id=generation_id, elapsed_s=round(time.time() - started, 1))
@@ -373,8 +382,15 @@ def stream_generation(
     Raises
     ------
     ServiceError
-        任一业务失败；失败记录已先行落库。
+        任一业务失败；生成期间失败会留痕，输入安全/隐私拦截发生在落库前。
     """
+    input_review = content_review.review_input(params)
+    if input_review["blocked"]:
+        raise ServiceError(
+            BizCode.CONTENT_BLOCKED,
+            "课题输入触发安全或隐私拦截；内容未保存或发送给生成模型。",
+            content_review=input_review,
+        )
     _check_rate(owner)
     if not _QUEUE_SLOT.acquire(blocking=False):
         raise ServiceError(BizCode.BUSY, "并发任务已满，请稍后重试", retry_after_ms=3000)
@@ -410,6 +426,13 @@ def start_generation(params: dict[str, Any], owner: str = "local") -> dict[str, 
     ServiceError
         ``RATE_LIMITED`` / ``BUSY`` / ``MODE_UNAVAILABLE``.
     """
+    input_review = content_review.review_input(params)
+    if input_review["blocked"]:
+        raise ServiceError(
+            BizCode.CONTENT_BLOCKED,
+            "课题输入触发安全或隐私拦截；内容未保存或发送给生成模型。",
+            content_review=input_review,
+        )
     _check_rate(owner)
     if not _QUEUE_SLOT.acquire(blocking=False):
         raise ServiceError(BizCode.BUSY, "并发任务已满，请稍后重试", retry_after_ms=3000)
@@ -482,7 +505,8 @@ def get_generation_status(generation_id: int, include_plan: bool = False) -> dic
     -------
     dict
         ``{generation_id, status, topic, grade, subject, textbook, nodes,
-        created_at, elapsed_s?, package?, error?, plan_preview?}``.
+        created_at, elapsed_s?, package?, error?, plan_preview?,
+        content_review?}``.
 
     Raises
     ------
@@ -504,6 +528,8 @@ def get_generation_status(generation_id: int, include_plan: bool = False) -> dic
         "nodes": nodes,
         "created_at": _iso_from_sql(record.get("created_at")),
     }
+    if detail.get("content_review"):
+        payload["content_review"] = detail["content_review"]
     if detail.get("elapsed_s") is not None:
         payload["elapsed_s"] = detail["elapsed_s"]
     if record["status"] == "done":
@@ -520,7 +546,9 @@ def get_generation_status(generation_id: int, include_plan: bool = False) -> dic
         payload["error"] = {
             "code": detail.get("error_code") or BizCode.INTERNAL,
             "message": detail.get("error") or "生成失败",
-            "retryable": detail.get("error_code") in (BizCode.TIMEOUT, BizCode.INTERNAL, BizCode.BUSY),
+            "retryable": detail.get("error_code") in (
+                BizCode.TIMEOUT, BizCode.INTERNAL, BizCode.BUSY
+            ),
         }
     return payload
 
@@ -582,6 +610,116 @@ def list_generations(limit: int = 10) -> dict[str, Any]:
         for row in rows
     ]
     return {"items": items, "count": len(items)}
+
+
+def list_recent_downloads(
+    limit: int = 50, now: datetime | None = None
+) -> list[dict[str, Any]]:
+    """List completed packages that remain available within the 24-hour window.
+
+    Parameters
+    ----------
+    limit : int
+        Maximum number of recent records to inspect, clamped to 1~200.
+    now : datetime or None
+        Optional timezone-aware UTC clock for deterministic tests.
+
+    Returns
+    -------
+    list of dict
+        ``{generation_id, label, expires_at}`` entries with all three
+        package files present and safely contained in ``OUTPUT_DIR``.
+    """
+    now_utc = now or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    now_utc = now_utc.astimezone(timezone.utc)
+    cutoff = now_utc - timedelta(hours=config.PACKAGE_DOWNLOAD_TTL_HOURS)
+    rows = storage.list_recent_generations(max(1, min(int(limit), 200)))
+    downloads: list[dict[str, Any]] = []
+    for generation_id, grade, subject, topic, status, created_at in rows:
+        if status != "done":
+            continue
+        try:
+            created = datetime.strptime(
+                str(created_at), "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if created < cutoff or created > now_utc:
+            continue
+        try:
+            package_files = {
+                kind: _safe_package_path(int(generation_id), kind)
+                for kind in ("zip", "docx", "pptx")
+            }
+        except ServiceError:
+            continue
+        expiry = created + timedelta(hours=config.PACKAGE_DOWNLOAD_TTL_HOURS)
+        downloads.append({
+            "generation_id": int(generation_id),
+            "label": (
+                f"#{generation_id} · {grade}{subject} · {str(topic)[:40]} "
+                f"· 截止 {expiry.astimezone().strftime('%m-%d %H:%M')}"
+            ),
+            "expires_at": expiry.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+    return downloads
+
+
+def get_recent_package_files(
+    generation_id: int, now: datetime | None = None
+) -> dict[str, Any]:
+    """Resolve package files for an unexpired generation in the 24-hour window.
+
+    Parameters
+    ----------
+    generation_id : int
+        Completed generation identifier.
+    now : datetime or None
+        Optional timezone-aware UTC clock for deterministic tests.
+
+    Returns
+    -------
+    dict
+        ``{generation_id, expires_at, files: {zip, docx, pptx}}`` with
+        absolute file paths suitable for the local Gradio file components.
+
+    Raises
+    ------
+    ServiceError
+        ``NOT_FOUND`` when the task is missing, incomplete, expired, or its
+        package files are unavailable or outside the output directory.
+    ValueError
+        If ``now`` is supplied without timezone information.
+    """
+    record = storage.get_generation(generation_id)
+    if record is None:
+        raise ServiceError(BizCode.NOT_FOUND, f"生成任务 #{generation_id} 不存在")
+    if record["status"] != "done":
+        raise ServiceError(BizCode.NOT_FOUND, f"任务 #{generation_id} 尚未成功完成")
+    try:
+        created = datetime.strptime(
+            str(record["created_at"]), "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise ServiceError(BizCode.NOT_FOUND, "生成记录时间无效，无法校验下载有效期") from error
+    now_utc = now or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    now_utc = now_utc.astimezone(timezone.utc)
+    expiry = created + timedelta(hours=config.PACKAGE_DOWNLOAD_TTL_HOURS)
+    if now_utc < created or now_utc >= expiry:
+        raise ServiceError(BizCode.NOT_FOUND, "该教学包已超过 24 小时下载期限")
+    files = {
+        kind: str(_safe_package_path(generation_id, kind))
+        for kind in ("zip", "docx", "pptx")
+    }
+    return {
+        "generation_id": generation_id,
+        "expires_at": expiry.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "files": files,
+    }
 
 
 def _safe_package_path(generation_id: int, kind: str) -> Path:

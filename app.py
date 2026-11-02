@@ -16,7 +16,7 @@ from typing import Any, Iterator
 
 import gradio as gr
 
-from xhzh import config, service, storage
+from xhzh import config, content_review, kb, service, storage
 from xhzh.adp_client import AdpClient
 from xhzh.workflow import render_plan_text
 
@@ -117,6 +117,66 @@ body {background: #f7f5f0 !important;}
     .form-col {position: static;}
     .plan-box {max-height: 60vh;}
 }
+/* 统一浅色界面；Gradio 会跟随系统深色模式，需覆盖其组件变量。 */
+body, body.dark {background: #f2f6f2 !important;}
+.gradio-container {
+    --body-background-fill: #f2f6f2;
+    --body-text-color: #23382e;
+    --body-text-color-subdued: #52675a;
+    --block-background-fill: #ffffff;
+    --block-border-color: #d6e2d9;
+    --block-label-text-color: #294638;
+    --block-info-text-color: #52675a;
+    --input-background-fill: #f8faf8;
+    --input-border-color: #cbdacf;
+    --button-secondary-background-fill: #eaf2eb;
+    --button-secondary-text-color: #294638;
+    --color-accent-soft: #e5efe7;
+    color: #23382e !important;
+    background: #f2f6f2 !important;
+}
+#app-header {
+    padding: 27px 30px 25px;
+    border: 1px solid #d7e6d9;
+    background: linear-gradient(120deg, #ffffff 0%, #edf6ef 100%);
+    box-shadow: 0 12px 30px rgba(34, 74, 48, .07);
+}
+.brand-title {font-size: 28px; color: #174c35;}
+.brand-sub {font-size: 14px; color: #455d4d;}
+.form-col, .result-col {
+    border-color: #d8e4da;
+    box-shadow: 0 10px 28px rgba(38, 67, 47, .07);
+    color: #23382e !important;
+}
+.section-title {font-size: 18px; font-weight: 750; color: #214d36; margin: 0 0 4px;}
+.section-subtitle {font-size: 13px; color: #52675a; margin: 0 0 16px; line-height: 1.6;}
+.form-col span[data-testid="block-info"] {
+    display: block; background: transparent !important; color: #294638 !important;
+    font-size: 13px; font-weight: 700; padding: 0 0 6px;
+}
+.form-col input, .form-col [role="combobox"] {
+    color: #243b2e !important; background: #f8faf8 !important;
+}
+.form-col .wrap, .form-col .wrap-inner, .form-col .secondary-wrap {
+    background: #f8faf8 !important; color: #243b2e !important;
+}
+.form-col .wrap {border: 1px solid #cbdacf !important; border-radius: 10px !important;}
+.form-col [role="listbox"], .form-col [role="option"] {
+    background: #fff !important; color: #243b2e !important;
+}
+.form-col [role="option"]:hover {background: #eaf3eb !important;}
+.form-col .info, .form-col [data-testid="block-label"] {color: #52675a !important;}
+.result-col button:not(.gen-btn button) {color: #294638 !important;}
+.result-col [data-testid="accordion"] {background: #f7faf7 !important;}
+.placeholder-hint {color: #52675a;}
+.plan-box {color: #23382e !important; background: #fcfdfb;}
+.plan-box p, .plan-box li, .result-col p {color: #34483b;}
+.plan-box h1, .plan-box h2, .plan-box h3 {color: #1f5139;}
+.gen-btn button {font-weight: 750 !important; min-height: 48px; border-radius: 10px !important;}
+@media (max-width: 720px) {
+    #app-header {padding: 20px;}
+    .brand-title {font-size: 24px;}
+}
 """
 
 
@@ -210,6 +270,99 @@ def _render_history() -> str:
     return "\n".join(lines)
 
 
+def _recent_download_choices() -> list[tuple[str, int]]:
+    """Build Gradio choices for completed packages still within 24 hours.
+
+    Returns
+    -------
+    list of tuple
+        Display label and generation id pairs.
+    """
+    return [
+        (item["label"], item["generation_id"])
+        for item in service.list_recent_downloads()
+    ]
+
+
+def _topic_choices(grade: str, subject: str) -> list[str]:
+    """List knowledge-base topics for the selected grade and subject."""
+    try:
+        names = [
+            card.name for card in kb.load_cards()
+            if card.grade_code in kb.GRADE_CODES.get(grade, ())
+            and card.subject_code == kb.SUBJECT_CODES.get(subject)
+        ]
+    except OSError:
+        names = [topic for g, s, topic in EXAMPLES if g == grade and s == subject]
+    return list(dict.fromkeys(names))
+
+
+def _update_topics(grade: str, subject: str) -> dict[str, Any]:
+    """Clear the old topic when grade or subject changes."""
+    return gr.update(choices=_topic_choices(grade, subject), value=None)
+
+
+def _friendly_error(error: Exception) -> str:
+    """Keep implementation details and raw model responses off the page."""
+    if isinstance(error, service.ServiceError):
+        messages = {
+            "CONTENT_BLOCKED": "输入或生成内容未通过自动预检，请查看下方审核提示。",
+            "MODE_UNAVAILABLE": "生成服务暂不可用，请检查配置后重试。",
+            "TIMEOUT": "生成超时，请稍后重试。",
+            "BUSY": "当前生成任务较多，请稍后重试。",
+            "PARAM_INVALID": "所选信息无效，请重新选择。",
+        }
+        if error.code in messages:
+            return messages[error.code]
+    return "生成未完成，请稍后重试；如持续失败，请联系管理员查看服务日志。"
+
+
+def refresh_recent_downloads() -> tuple[dict[str, Any], str]:
+    """Refresh the list of packages available for 24-hour retrieval.
+
+    Returns
+    -------
+    tuple
+        Gradio update for the selector and a user-facing status message.
+    """
+    choices = _recent_download_choices()
+    if not choices:
+        return gr.update(choices=[], value=None), "_最近 24 小时内没有可重新下载的教学包。_"
+    return (
+        gr.update(choices=choices, value=None),
+        f"找到 {len(choices)} 个仍在 24 小时有效期内的教学包。",
+    )
+
+
+def retrieve_recent_package(generation_id: int | None) -> tuple[str | None, str | None, str | None, str]:
+    """Load an unexpired teaching package into the download components.
+
+    Parameters
+    ----------
+    generation_id : int or None
+        Selected generation id from the recent-package list.
+
+    Returns
+    -------
+    tuple
+        Zip, Word and PowerPoint paths plus a status message.
+    """
+    if generation_id is None:
+        return None, None, None, "❗ 请先选择一条生成记录。"
+    try:
+        package = service.get_recent_package_files(int(generation_id))
+    except (service.ServiceError, ValueError) as error:
+        message = error.message if isinstance(error, service.ServiceError) else str(error)
+        return None, None, None, f"❌ 无法恢复下载：{message}"
+    files = package["files"]
+    return (
+        files["zip"],
+        files["docx"],
+        files["pptx"],
+        "✅ 已恢复下载；该教学包将在 24 小时有效期结束后不可再取回。",
+    )
+
+
 def _render_detail(result: dict[str, Any]) -> str:
     """Render generation metadata (KB refs, rural checks, timings).
 
@@ -235,6 +388,9 @@ def _render_detail(result: dict[str, Any]) -> str:
         lines += [f"- ⚠️ {warning}" for warning in warnings]
     else:
         lines.append("**乡土化数值复核**：✅ 通过")
+    report = result.get("content_review")
+    if isinstance(report, dict):
+        lines += ["", content_review.render_report_markdown(report)]
     return "\n\n".join(lines)
 
 
@@ -260,11 +416,11 @@ def generate(
     idle_button = gr.update(interactive=True, value="🚀 生成教学包")
     busy_button = gr.update(interactive=False, value="⏳ 生成中…")
 
-    if not topic.strip():
+    if not topic or not topic.strip():
         yield (
             _render_steps(["pending"] * 4, {}),
             "",
-            "❗ **请输入课题后再点击生成**",
+            "❗ **请先选择课题，再点击生成**",
             _render_history(),
             None, None, None,
             idle_button, gr.update(),
@@ -275,6 +431,7 @@ def generate(
     states = ["pending"] * 4
     elapsed: dict[int, float] = {}
     generation_id = 0
+    review_report: dict[str, Any] | None = None
     try:
         yield _render_steps(["pending"] * 4, {}), "", "", _render_history(), None, None, None, busy_button, gr.update()
         # 与 MCP 通道共用同一段编排（service 内部落库、记录节点进度、归类异常）
@@ -284,6 +441,24 @@ def generate(
         ):
             if event["type"] == "started":
                 generation_id = int(event["generation_id"])
+                continue
+            if event["type"] == "review":
+                report = event.get("report")
+                review_report = report if isinstance(report, dict) else None
+                review_text = (
+                    content_review.render_report_markdown(review_report)
+                    if review_report is not None
+                    else "⚠️ 自动预检报告不可用。"
+                )
+                yield (
+                    _render_steps(states, elapsed),
+                    "",
+                    review_text,
+                    _render_history(),
+                    None, None, None,
+                    gr.update(),
+                    gr.update(),
+                )
                 continue
             if event["type"] == "progress":
                 states[event["node"]] = event["status"]
@@ -303,14 +478,24 @@ def generate(
                 gr.update(open=True),  # 产物就绪，自动展开下载区
             )
     except Exception as error:  # noqa: BLE001 —— 单点失败要回显给教师，不能静默
-        # 失败记录已由 service 落库（含 error_code）；这里只负责把信息回显给教师
-        # 失败节点标红，而不是把步骤条重置为全 pending（保留"挂在哪一步"的信息）
+        # 生成期间失败由 service 落库；输入预检拦截发生在落库前。
+        # 失败节点标红而不是把步骤条重置为全 pending。
+        if isinstance(error, service.ServiceError) and error.content_review is not None:
+            review_report = error.content_review
         fail_states = ["failed" if state == "running" else state for state in states]
         record = f"#{generation_id}" if generation_id else "未落库"
+        review_text = (
+            content_review.render_report_markdown(review_report)
+            if review_report is not None
+            else ""
+        )
+        detail_text = f"❌ **生成失败**：{_friendly_error(error)}\n\n记录 {record}。"
+        if review_text:
+            detail_text = f"{detail_text}\n\n{review_text}"
         yield (
             _render_steps(fail_states, elapsed),
             "",
-            f"❌ **生成失败**：{error}\n\n已留痕（记录 {record}），请检查运行模式与配置后重试。",
+            detail_text,
             _render_history(),
             None, None, None,
             idle_button,  # 恢复可点，允许重试
@@ -336,27 +521,28 @@ def build_ui(theme: Any = None, css: str | None = None) -> gr.Blocks:
         gr.HTML(_header_html(), elem_id="app-header")
         with gr.Row(elem_classes=["main-row"]):
             # 左栏：只放输入与触发，一屏可见
-            with gr.Column(scale=1, min_width=220, elem_classes=["form-col"]):
-                grade = gr.Dropdown(choices=config.GRADES, value=config.GRADES[0], label="年级")
-                subject = gr.Dropdown(
-                    choices=config.SUBJECTS, value=config.SUBJECTS[0], label="学科"
-                )
+            with gr.Column(scale=2, min_width=270, elem_classes=["form-col"]):
+                gr.HTML("<div class='section-title'>创建教学包</div><div class='section-subtitle'>按顺序选择课程信息，即可开始生成。</div>")
+                with gr.Row():
+                    grade = gr.Dropdown(choices=config.GRADES, value=config.GRADES[0], label="年级", min_width=110)
+                    subject = gr.Dropdown(
+                        choices=config.SUBJECTS, value=config.SUBJECTS[0], label="学科", min_width=110
+                    )
                 textbook = gr.Dropdown(
                     choices=[config.TEXTBOOK], value=config.TEXTBOOK, label="教材版本"
                 )
-                topic = gr.Textbox(
-                    label="课题", placeholder="例如：一元一次方程的实际应用", lines=1
+                topic = gr.Dropdown(
+                    choices=_topic_choices(config.GRADES[0], config.SUBJECTS[0]),
+                    value=None,
+                    label="课题",
+                    info="先选择年级和学科，再从对应课题中选择",
                 )
                 button = gr.Button(
                     "🚀 生成教学包", variant="primary", size="lg", elem_classes=["gen-btn"]
                 )
-                gr.Examples(
-                    examples=EXAMPLES,
-                    inputs=[grade, subject, topic],
-                    label="常用课题（点击填充）",
-                )
             # 右栏：一条主线（步骤 → 教案 → 下载），明细与历史默认收起
-            with gr.Column(scale=3, min_width=420, elem_classes=["result-col"]):
+            with gr.Column(scale=3, min_width=360, elem_classes=["result-col"]):
+                gr.HTML("<div class='section-title'>生成结果</div><div class='section-subtitle'>实时查看进度、预览教案并下载文件。</div>")
                 steps = gr.HTML(
                     value="<div class='placeholder-hint'>⏳ 点击「生成教学包」后，这里显示四个节点的实时进度</div>"
                 )
@@ -369,10 +555,27 @@ def build_ui(theme: Any = None, css: str | None = None) -> gr.Blocks:
                     with gr.Row():
                         file_docx = gr.File(label="教案（Word）")
                         file_pptx = gr.File(label="课件（PPT）")
-                with gr.Accordion("生成明细（知识点卡 / 乡土化复核）", open=False):
+                with gr.Accordion("审核与生成明细（自动预检）", open=False):
                     detail = gr.Markdown(value="_生成后在此展示明细_")
                 with gr.Accordion("历史记录", open=False):
                     history = gr.Markdown(value=_render_history())
+                    gr.Markdown("最近 24 小时内生成成功的教学包可在此恢复下载。")
+                    recent_downloads = gr.Dropdown(
+                        choices=_recent_download_choices(),
+                        value=None,
+                        label="选择教学包",
+                    )
+                    with gr.Row():
+                        refresh_downloads = gr.Button("刷新记录")
+                        retrieve_download = gr.Button("恢复下载", variant="secondary")
+                    retrieval_status = gr.Markdown(value="")
+                    with gr.Row():
+                        recent_zip = gr.File(label="教学包（zip）")
+                    with gr.Row():
+                        recent_docx = gr.File(label="教案（Word）")
+                        recent_pptx = gr.File(label="课件（PPT）")
+        grade.change(_update_topics, inputs=[grade, subject], outputs=topic)
+        subject.change(_update_topics, inputs=[grade, subject], outputs=topic)
         button.click(
             generate,
             inputs=[grade, subject, textbook, topic],
@@ -380,6 +583,15 @@ def build_ui(theme: Any = None, css: str | None = None) -> gr.Blocks:
                 steps, plan, detail, history, file_zip, file_docx, file_pptx,
                 button, download,
             ],
+        )
+        refresh_downloads.click(
+            refresh_recent_downloads,
+            outputs=[recent_downloads, retrieval_status],
+        )
+        retrieve_download.click(
+            retrieve_recent_package,
+            inputs=[recent_downloads],
+            outputs=[recent_zip, recent_docx, recent_pptx, retrieval_status],
         )
     return ui
 
@@ -395,7 +607,7 @@ if __name__ == "__main__":
         css=_CUSTOM_CSS,
         share=config.SHARE,
         server_port=config.PORT,
-        show_error=True,
+        show_error=False,
         # Gradio 6 默认只服务 cwd 内文件；产物目录显式放行，避免换目录启动时下载 403
         allowed_paths=[str(config.OUTPUT_DIR)],
     )

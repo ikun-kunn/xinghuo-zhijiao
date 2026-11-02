@@ -107,12 +107,53 @@ def build_script(params: dict[str, Any], result: dict[str, Any], mode: str) -> l
             messages = prompts.build_courseware_messages(params, result)
             data = llm.extract_json(llm.chat(messages, timeout=config.LLM_TIMEOUT))
             script = _normalize(data.get("slides"))
-            if script:
+            if script and _meets_release_requirements(script):
                 return script
-            logger.warning("课件脚本为空，降级为模板脚本")
+            logger.warning("课件脚本未满足页数、练习或配图要求，降级为模板脚本")
         except Exception as error:  # noqa: BLE001 - 增强项，任何失败都降级
             logger.warning("课件脚本生成失败，降级为模板脚本：%s", error)
     return _fallback_script(params, result)
+
+
+def _meets_release_requirements(slides: list[dict[str, Any]]) -> bool:
+    """Check release-minimum slide count, exercises, answers and scenes.
+
+    Parameters
+    ----------
+    slides : list of dict
+        Normalized courseware slide specifications.
+
+    Returns
+    -------
+    bool
+        ``True`` when the script satisfies the PRD minimums and fits the
+        9-to-12-slide delivery budget.
+    """
+    if not 9 <= len(slides) <= 12:
+        return False
+    basic_count = sum(
+        len(as_str_list(slide.get("points")))
+        for slide in slides
+        if slide.get("kind") == "practice"
+    )
+    extend_count = sum(
+        len(as_str_list(slide.get("points")))
+        for slide in slides
+        if slide.get("kind") == "game"
+    )
+    answer_count = sum(
+        len(as_str_list(slide.get("points")))
+        for slide in slides
+        if slide.get("kind") == "answer"
+    )
+    scene_count = sum(
+        1
+        for slide in slides
+        if slide.get("kind") in ("cover", "hook", "practice", "game")
+        and isinstance(slide.get("visual"), dict)
+        and slide["visual"].get("type") == "scene"
+    )
+    return basic_count >= 4 and extend_count >= 4 and answer_count >= 8 and scene_count >= 3
 
 
 def _normalize(raw_slides: Any) -> list[dict[str, Any]]:
@@ -264,7 +305,7 @@ def _fallback_script(params: dict[str, Any], result: dict[str, Any]) -> list[dic
             "visual": {"type": "iconrow", "icons": infer_icons(tip_points)},
         })
 
-    if stages:
+    if stages and len(basic) + len(extend) < 8:
         slides.append({
             "kind": "route",
             "title": "闯关路线",
@@ -301,7 +342,7 @@ def _fallback_script(params: dict[str, Any], result: dict[str, Any]) -> list[dic
             "visual": _visual_for_exercise(chunk[0], "seg"),
         })
 
-    for index in range(0, len(answers), 3):
+    for index in range(0, len(answers), 4):
         slides.append({
             "kind": "answer",
             "title": f"答案揭晓 {index // 3 + 1}",

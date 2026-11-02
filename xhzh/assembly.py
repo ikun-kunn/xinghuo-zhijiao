@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, content_review
 
 
 def build_package(result: dict[str, Any]) -> dict[str, str]:
@@ -45,7 +45,55 @@ def build_package(result: dict[str, Any]) -> dict[str, str]:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(docx_path, docx_path.name)
         zf.write(pptx_path, pptx_path.name)
+        report = result.get("content_review")
+        if isinstance(report, dict):
+            zf.writestr(
+                "自动预检报告.md",
+                content_review.render_report_markdown(report),
+            )
+        for theme, image_path in _package_scene_images(result):
+            zf.write(image_path, f"配图/{theme}{image_path.suffix.lower()}")
     return {"docx": str(docx_path), "pptx": str(pptx_path), "zip": str(zip_path)}
+
+
+def _package_scene_images(result: dict[str, Any]) -> list[tuple[str, Path]]:
+    """Collect up to three reviewed scene illustrations for the ZIP package.
+
+    Parameters
+    ----------
+    result : dict
+        Final workflow result, optionally including a courseware slide script.
+
+    Returns
+    -------
+    list of tuple
+        ``(theme, path)`` pairs for unique available illustrations, preferring
+        themes used by scene-bearing slides before filling from the reviewed
+        rural illustration library.
+    """
+    from . import visuals
+
+    themes: list[str] = []
+    for spec in result.get("courseware") or []:
+        if not isinstance(spec, dict):
+            continue
+        kind = str(spec.get("kind") or "explore")
+        points = [str(point) for point in (spec.get("points") or [])]
+        planned = visuals.plan_visual(spec, kind, points)
+        if planned and planned.get("type") == "scene":
+            theme = str(planned.get("theme") or "").strip().lower()
+            if theme in visuals.SCENE_THEMES and theme not in themes:
+                themes.append(theme)
+    themes.extend(theme for theme in visuals.SCENE_THEMES if theme not in themes)
+
+    images: list[tuple[str, Path]] = []
+    for theme in themes:
+        image_path = visuals.scene_image(theme)
+        if image_path is not None and image_path.is_file():
+            images.append((theme, image_path))
+        if len(images) >= 3:
+            break
+    return images
 
 
 def _unique_paths(output_dir: Path, stem: str) -> tuple[Path, Path, Path]:

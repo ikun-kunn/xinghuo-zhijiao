@@ -70,6 +70,8 @@ class BizCode:
         超过请求级或任务级预算。
     MODE_UNAVAILABLE : str
         ``XHZH_MODE=adp`` 未接入、或知识库缺失导致能力不可用。
+    CONTENT_BLOCKED : str
+        自动预检发现高风险安全/隐私内容，教学包被阻止交付。
     INTERNAL : str
         未归类异常。
     """
@@ -81,6 +83,7 @@ class BizCode:
     BUSY = "BUSY"
     TIMEOUT = "TIMEOUT"
     MODE_UNAVAILABLE = "MODE_UNAVAILABLE"
+    CONTENT_BLOCKED = "CONTENT_BLOCKED"
     INTERNAL = "INTERNAL"
 
 
@@ -93,6 +96,7 @@ BIZ_RETRYABLE = {
     BizCode.BUSY: True,
     BizCode.TIMEOUT: True,
     BizCode.MODE_UNAVAILABLE: False,
+    BizCode.CONTENT_BLOCKED: False,
     BizCode.INTERNAL: True,
 }
 
@@ -108,14 +112,23 @@ class ServiceError(Exception):
         面向调用方的中文说明（不得包含密钥、绝对路径）。
     retry_after_ms : int or None
         建议重试间隔，仅 ``RATE_LIMITED`` / ``BUSY`` 使用。
+    content_review : dict or None
+        可选的自动预检报告；只在内容安全/隐私阻断时返回。
     """
 
-    def __init__(self, code: str, message: str, retry_after_ms: int | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        retry_after_ms: int | None = None,
+        content_review: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retry_after_ms = retry_after_ms
         self.retryable = BIZ_RETRYABLE.get(code, True)
+        self.content_review = content_review
 
     def to_dict(self) -> dict[str, Any]:
         """Render the error payload for ``structuredContent.error``.
@@ -132,6 +145,8 @@ class ServiceError(Exception):
         }
         if self.retry_after_ms is not None:
             payload["retry_after_ms"] = self.retry_after_ms
+        if self.content_review is not None:
+            payload["content_review"] = self.content_review
         return payload
 
 

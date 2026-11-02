@@ -83,6 +83,27 @@ class AdpClient:
         for attempt in range(attempts):
             try:
                 output = llm.extract_json(llm.chat(messages, timeout=config.LLM_TIMEOUT))
+                if node == 2:
+                    exercise_counts = {
+                        field: len([
+                            item for item in output.get(field, [])
+                            if isinstance(item, str) and item.strip()
+                        ]) if isinstance(output.get(field), list) else 0
+                        for field in ("exercises_basic", "exercises_extend")
+                    }
+                    answer_count = len([
+                        item for item in output.get("answers", [])
+                        if isinstance(item, str) and item.strip()
+                    ]) if isinstance(output.get("answers"), list) else 0
+                    exercise_count = sum(exercise_counts.values())
+                    if (
+                        exercise_counts["exercises_basic"] < 4
+                        or exercise_counts["exercises_extend"] < 4
+                        or answer_count != exercise_count
+                    ):
+                        raise llm.LLMError(
+                            "教具输出未达标：基础题和拓展题各需至少 4 题，且答案解析须逐题对应"
+                        )
                 output["kb_card_ids"] = [card.card_id for card in cards]
                 output["kb_empty"] = len(cards) == 0
                 return output
@@ -120,13 +141,27 @@ class AdpClient:
             }
         if node == 2:
             return {
-                "exercises_basic": ["基础1：结合课本例题完成同类练习", "基础2：判断并改错"],
-                "exercises_extend": ["拓展1：用本课知识解决一个家庭/生产中的实际问题", "拓展2：小组讨论并展示思路"],
+                "exercises_basic": [
+                    f"集市情境：围绕「{topic}」找出问题中的关键条件，并写出处理步骤。",
+                    f"田间情境：举例说明「{topic}」怎样帮助解决一个生产生活问题。",
+                    f"校园情境：完成一道「{topic}」基础题，并写出判断或推理依据。",
+                    f"农具情境：用「{topic}」分析一个实际问题，列出关键步骤。",
+                ],
+                "exercises_extend": [
+                    f"养殖情境：设计一道「{topic}」应用题，并写出完整解答过程。",
+                    f"赶集出行情境：将「{topic}」用于解决一个实际问题，说明方法为何成立。",
+                    f"集市情境：比较两种运用「{topic}」解决问题的方法，并说明适用条件。",
+                    f"田间情境：指出一个容易误用「{topic}」的例子，订正并解释理由。",
+                ],
                 "answers": [
-                    "基础1：按例题步骤设未知数、列方程后求解（对照课本答案）",
-                    "基础2：指出错误步骤并说明依据（等式性质/运算法则）",
-                    "拓展1：设未知数→列方程→求解→检验作答",
-                    "拓展2：答案开放，评价要点为思路清晰、方程正确",
+                    f"参考答案：结合本课「{topic}」知识点卡列出关键条件；解析：说明条件与所用概念的对应关系。",
+                    f"参考答案：给出一个与「{topic}」直接相关的生产生活例子；解析：指出知识点如何用于处理该情境。",
+                    f"参考答案：按本课「{topic}」方法完成题目；解析：写清判断依据或推理过程，并检查结论。",
+                    f"参考答案：列出解决农具情境问题所需步骤；解析：每步均应对应「{topic}」中的规则或方法。",
+                    f"参考答案：题目、解答均围绕「{topic}」且条件完整；解析：逐步展示方法并验证结论。",
+                    f"参考答案：给出适用「{topic}」的出行情境和完整推理；解析：解释方法与条件的对应关系。",
+                    f"参考答案：指出两种方法的步骤及各自适用条件；解析：依据「{topic}」比较其异同。",
+                    f"参考答案：指出误用之处并给出正确做法；解析：说明正确做法符合「{topic}」的知识规则。",
                 ],
                 "board": f"《{topic}》板书：核心概念 → 方法步骤 → 易错提醒",
             }

@@ -5,8 +5,8 @@ Run
     python tests/test_suite.py          # 全量
     python tests/test_suite.py kb llm   # 只跑指定分组
 
-覆盖：config / kb / llm / rural / workflow(mock+llm病态) / assembly /
-storage / app。所有断言用真实运行结果验证，失败即非零退出码。
+覆盖：config / kb / llm / rural / content-review / workflow(mock+llm病态) /
+assembly / storage / app。所有断言用真实运行结果验证，失败即非零退出码。
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ import re
 import sqlite3
 import sys
 import tempfile
-from datetime import datetime, timezone
+import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -255,6 +256,123 @@ def test_rural() -> None:
 
 
 # ---------------------------------------------------------------------------
+# content review (rules-based preflight)
+# ---------------------------------------------------------------------------
+def test_content_review() -> None:
+    section("content review 自动预检")
+    from xhzh import content_review, workflow
+    from xhzh.adp_client import AdpClient
+
+    sample = {
+        "meta": {"grade": "七年级", "subject": "数学", "textbook": "人教版", "topic": "一元一次方程"},
+        "standard_ref": "知识点卡参考",
+        "kb_card_ids": ["MAT-7A-3-0-K01"],
+        "kb_empty": False,
+        "goals_basic": ["掌握方程基本步骤"],
+        "goals_extend": ["能迁移解决实际问题"],
+        "stages": [
+            {"name": "导入", "minutes": 5},
+            {"name": "探究", "minutes": 15},
+            {"name": "练习", "minutes": 15},
+            {"name": "总结", "minutes": 10},
+        ],
+        "exercises_basic": [f"基础题{i}：解一元一次方程并说明步骤" for i in range(1, 5)],
+        "exercises_extend": [f"拓展题{i}：用方程分析生活问题并解释理由" for i in range(1, 5)],
+        "answers": [f"答案与解析{i}：列出步骤并验证结果" for i in range(1, 9)],
+        "courseware": [{"title": f"一元一次方程第{i}页"} for i in range(1, 10)],
+        "rural_warnings": [],
+    }
+
+    report = content_review.review_content(sample)
+    check("完整且无明显风险的样例通过", report["status"] == "clear", str(report))
+    check("报告含六类检查结果", len(report["checks"]) == 6, str(report["checks"]))
+
+    risky = dict(sample)
+    risky["meta"] = dict(sample["meta"], topic="联系电话：13800138000")
+    risky["scaffolding"] = "自残详细步骤"
+    risky_report = content_review.review_content(risky)
+    rendered = content_review.render_report_markdown(risky_report)
+    check("联系方式与明确伤害指导触发高风险阻断",
+          risky_report["status"] == "blocked" and risky_report["counts"]["high"] == 2,
+          str(risky_report))
+    check("预检报告不回显敏感号码", "13800138000" not in rendered)
+
+    hateful = dict(sample, framework="农村人都是垃圾")
+    check("针对群体的贬损内容触发阻断",
+          content_review.review_content(hateful)["status"] == "blocked")
+    sensitive_topic = dict(sample, framework="毒品防治教育")
+    check("敏感教学主题提示复核但不直接阻断",
+          content_review.review_content(sensitive_topic)["status"] == "review")
+    prevention = dict(sample, framework="反对某民族都是垃圾的歧视表达")
+    check("明确的批判/预防语境降为人工复核",
+          content_review.review_content(prevention)["status"] == "review")
+
+    no_source = dict(sample, kb_card_ids=[], kb_empty=True)
+    check("知识库无匹配转为教师复核而非阻断",
+          content_review.review_content(no_source)["status"] == "review")
+
+    short_answers = dict(sample, answers=["一条答案"])
+    check("答案数量不匹配要求复核",
+          any(item["code"] == "exercise_answer_count_mismatch"
+              for item in content_review.review_content(short_answers)["findings"]))
+
+    rural_risk = dict(sample, rural_warnings=["金额可能不合理"])
+    check("乡土数值告警进入审核报告",
+          any(item["category"] == "乡土"
+              for item in content_review.review_content(rural_risk)["findings"]))
+
+    events = []
+    generation = workflow.run_generation(
+        "七年级", "数学", "人教版", "联系电话：13800138000", client=AdpClient("mock")
+    )
+    with mock.patch.object(workflow, "build_package") as build_package:
+        try:
+            while True:
+                events.append(next(generation))
+        except content_review.ContentReviewBlocked:
+            pass
+        check("高风险工作流发出审核报告后阻断",
+              any(event.get("type") == "review"
+                  and event["report"]["status"] == "blocked" for event in events))
+        check("被阻断内容不会组装成可下载教学包", not build_package.called)
+
+    from xhzh import service
+    try:
+        for event in service.stream_generation(
+            {
+                "grade": "七年级", "subject": "数学", "textbook": "人教版",
+                "topic": "联系电话：13800138000",
+            },
+            client=AdpClient("mock"),
+            owner="content-review-test",
+        ):
+            check("输入隐私筛查在启动任务前执行", False, str(event))
+    except service.ServiceError as error:
+        check("高风险服务错误使用不可重试业务码",
+              error.code == service.BizCode.CONTENT_BLOCKED and not error.retryable,
+              f"{error.code} retryable={error.retryable}")
+        check("输入拦截报告不回显号码",
+              error.content_review is not None
+              and error.content_review["status"] == "blocked"
+              and "13800138000" not in str(error.to_dict()))
+
+    with mock.patch.object(service.storage, "save_generation") as save_generation:
+        try:
+            service.start_generation(
+                {
+                    "grade": "七年级", "subject": "数学", "textbook": "人教版",
+                    "topic": "联系电话：13800138000",
+                },
+                owner="content-review-background-test",
+            )
+            check("异步入口在落库前拦截高风险输入", False)
+        except service.ServiceError as error:
+            check("异步入口返回 CONTENT_BLOCKED",
+                  error.code == service.BizCode.CONTENT_BLOCKED)
+            check("异步拦截不保存输入", not save_generation.called)
+
+
+# ---------------------------------------------------------------------------
 # workflow（mock 全链路 + llm 病态输出）
 # ---------------------------------------------------------------------------
 def _bad_llm_outputs():
@@ -280,6 +398,28 @@ def test_workflow_mock() -> None:
     check("教案含课标依据", "课标依据" in plan)
     check("教案含双目标", "基础巩固" in plan and "拓展提升" in plan)
     check("教案含乡土化告警区", "随堂练习" in plan)
+    check("基础练习不少于 4 题", len(result["exercises_basic"]) >= 4)
+    check("拓展练习不少于 4 题", len(result["exercises_extend"]) >= 4)
+    check("答案解析逐题对应", len(result["answers"]) == 8)
+    check("课件脚本在 9~12 页内", 9 <= len(result["courseware"]) <= 12, str(len(result["courseware"])))
+    check("工作流附带自动预检报告",
+          isinstance(result.get("content_review"), dict)
+          and "自动预检报告" in plan)
+    with zipfile.ZipFile(package["zip"]) as archive:
+        image_files = [name for name in archive.namelist() if name.startswith("配图/")]
+        has_review = "自动预检报告.md" in archive.namelist()
+    check("ZIP 教学包含至少 3 张配图", len(image_files) >= 3, str(image_files))
+    check("ZIP 包含独立自动预检报告", has_review)
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    deck = Presentation(package["pptx"])
+    picture_count = sum(
+        shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+        for slide in deck.slides
+        for shape in slide.shapes
+    )
+    check("PPT 内嵌至少 3 张配图", picture_count >= 3, str(picture_count))
 
 
 def test_workflow_llm_pathological() -> None:
@@ -315,13 +455,43 @@ def test_workflow_llm_pathological() -> None:
 
     # 场景3：合法极简输出 —— 全链路可跑通
     def minimal(messages, **kwargs):
+        if "节点③ 教具生成" in messages[-1]["content"]:
+            basic = [f"基础题{i}：围绕课题写出完整练习题" for i in range(1, 5)]
+            extend = [f"拓展题{i}：设计本课知识的应用题" for i in range(1, 5)]
+            answers = [f"答案解析{i}：根据本课知识点逐步推理并验证结论" for i in range(1, 9)]
+            return json.dumps({
+                "exercises_basic": basic,
+                "exercises_extend": extend,
+                "answers": answers,
+                "board": "核心概念 → 方法步骤 → 易错提醒",
+            }, ensure_ascii=False)
         return '{"standard_ref": "x", "objectives": ["a"], "key_points": ["b"], "difficult_points": ["c"], "stages": [{"name": "导入", "minutes": 5}]}'
 
     with mock.patch.object(llm, "chat", minimal), mock.patch.object(llm, "is_configured", lambda: True):
         events = list(workflow.run_generation("七年级", "数学", "人教版", "一元一次方程", client=AdpClient("llm")))
-        check("llm 极简输出端到端可跑", events[-1]["type"] == "done")
+        check("llm 输出满足数量要求后端到端可跑", events[-1]["type"] == "done")
         result = events[-1]["result"]
         check("产物落盘", all(Path(p).exists() for p in result["package"].values()))
+        check("LLM 端到端保留 8 题及解析",
+              len(result["exercises_basic"]) >= 4
+              and len(result["exercises_extend"]) >= 4
+              and len(result["answers"]) == 8)
+
+    # 场景4：节点③连续返回不足 8 题——重试耗尽后明确失败
+    calls = {"n": 0}
+
+    def insufficient(messages, **kwargs):
+        calls["n"] += 1
+        return '{"exercises_basic":["一道基础题"],"exercises_extend":["一道拓展题"],"answers":["参考答案"],"board":"板书"}'
+
+    with mock.patch.object(llm, "chat", insufficient), mock.patch.object(llm, "is_configured", lambda: True):
+        try:
+            AdpClient("llm").call_node(
+                2, {"grade": "七年级", "subject": "数学", "textbook": "人教版", "topic": "一元一次方程"}, {}
+            )
+            check("节点③不足 8 题不得成功", False)
+        except llm.LLMError:
+            check("节点③不足 8 题经过 D2 重试后明确失败", calls["n"] == 3, str(calls["n"]))
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +657,12 @@ def test_visuals() -> None:
         if shape.shape_type == MSO_SHAPE_TYPE.PICTURE
     ]
     check("场景卡插入图片形状（PICTURE）", bool(pictures), str(pictures[:3]))
+    check("课件实际嵌入至少 3 张插图", len(pictures) >= 3, str(len(pictures)))
+    with zipfile.ZipFile(pkg["zip"]) as archive:
+        packaged_images = [name for name in archive.namelist() if name.startswith("配图/")]
+    check("ZIP 同时包含配图文件夹和至少 3 张素材",
+          len(packaged_images) >= 3 and all(name.count("/") == 1 for name in packaged_images),
+          str(packaged_images))
     watermark = any(
         "AI 生成配图" in shape.text_frame.text
         for slide in prs.slides
@@ -677,12 +853,21 @@ def test_app() -> None:
     out = next(app.generate("七年级", "数学", "人教版", "   "))
     check("空白课题被拒绝", "请输入课题" in out[2])
 
+    blocked_input = list(app.generate(
+        "七年级", "数学", "人教版", "联系电话：13800138000"
+    ))[-1]
+    check("输入隐私拦截向教师展示不含号码的报告",
+          "自动预检报告" in blocked_input[2]
+          and "13800138000" not in blocked_input[2]
+          and blocked_input[4] is None)
+
     events = list(app.generate("七年级", "语文", "人教版", "比喻拟人修辞"))
     final = events[-1]
     check("输出元组结构为 9", len(final) == 9)
     check("三件套路径有效", all(Path(p).exists() for p in final[4:7]))
     check("教案预览非空", "# 比喻拟人修辞" in final[1])
     check("生成明细含知识点卡", "知识点卡引用" in final[2])
+    check("生成明细展示自动预检结果", "自动预检报告" in final[2])
     check("历史记录含本地时间", re.search(r"\d{2}-\d{2} \d{2}:\d{2}", final[3]) is not None, final[3][:80])
 
     # 交互防护：生成期间按钮禁用，结束后恢复
@@ -700,6 +885,30 @@ def test_app() -> None:
     check("有匹配时明细不含'无匹配'", "无匹配" not in consistent[2], consistent[2][:120])
     check("有匹配时明细含知识点卡 ID", "MAT-7A-3-0-K01" in consistent[2])
     check("教案与明细课标口径一致", ("暂无课标依据" in consistent[1]) == ("无匹配" in consistent[2]))
+
+    from xhzh import service as _service, storage as _storage
+    recent_choices = app._recent_download_choices()
+    check("历史下拉仅列可恢复的近期教学包", bool(recent_choices), str(recent_choices[:1]))
+    if recent_choices:
+        recent_id = recent_choices[0][1]
+        restored = app.retrieve_recent_package(recent_id)
+        check("24 小时内可恢复 zip/docx/pptx",
+              all(path and Path(path).is_file() for path in restored[:3])
+              and "已恢复下载" in restored[3],
+              restored[3])
+        expired_at = (datetime.now(timezone.utc) - timedelta(hours=25)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(_storage.config.DB_PATH) as conn:
+            conn.execute(
+                "UPDATE generations SET created_at=? WHERE id=?",
+                (expired_at, recent_id),
+            )
+        try:
+            _service.get_recent_package_files(recent_id)
+            check("超过 24 小时的教学包拒绝恢复下载", False)
+        except _service.ServiceError:
+            check("超过 24 小时的教学包拒绝恢复下载", True)
+        still_available = {value for _, value in app._recent_download_choices()}
+        check("超过 24 小时的教学包从下拉列表移除", recent_id not in still_available)
 
     # 失败路径：步骤条保留失败节点（不重置为全 pending）
     from xhzh import config as _cfg
@@ -726,6 +935,7 @@ GROUPS = {
     "kb": test_kb,
     "llm": test_llm,
     "rural": test_rural,
+    "content-review": test_content_review,
     "workflow": test_workflow_mock,
     "workflow-llm": test_workflow_llm_pathological,
     "assembly": test_assembly,

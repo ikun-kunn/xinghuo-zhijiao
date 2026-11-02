@@ -45,6 +45,7 @@ _load_dotenv(BASE_DIR / ".env")
 DATA_DIR = Path(os.getenv("XHZH_DATA_DIR", BASE_DIR / "data"))
 OUTPUT_DIR = DATA_DIR / "packages"
 DB_PATH = DATA_DIR / "xinghuo.db"
+PACKAGE_DOWNLOAD_TTL_HOURS = 24
 
 # WorkBuddy（腾讯云 ADP）凭据占位：真实接入时通过环境变量注入
 ADP_SECRET_ID = os.getenv("ADP_SECRET_ID", "")

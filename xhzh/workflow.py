@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from typing import Any, Iterator
 
-from . import config, rural
+from . import config, content_review, rural
 from .adp_client import AdpClient
 from .assembly import build_package
 from .courseware import as_str_list, build_script
@@ -91,6 +91,11 @@ def run_generation(
     # 课件脚本：把教案改写成"学生看得进去"的分页脚本（悬念/闯关/挑战/揭晓）。
     # 属增强项，内部任何失败都会降级为模板脚本，不会中断打包。
     result["courseware"] = build_script(params, result, client.mode)
+    review_report = content_review.review_content(result)
+    result["content_review"] = review_report
+    yield {"type": "review", "report": review_report}
+    if review_report["blocked"]:
+        raise content_review.ContentReviewBlocked()
     package = build_package(result)
     result["package"] = package
     yield {
@@ -189,4 +194,6 @@ def render_plan_text(result: dict[str, Any]) -> str:
         lines += ["", "## 课堂支持策略（学情适配）", result["scaffolding"]]
     if result.get("kb_card_ids"):
         lines += ["", f"知识点卡引用：{'、'.join(result['kb_card_ids'])}"]
+    if result.get("content_review"):
+        lines += ["", content_review.render_report_markdown(result["content_review"])]
     return "\n".join(lines)

@@ -442,6 +442,18 @@ def test_errors_and_permissions() -> None:
     check("J-8 非法参数为 -32602", bad.get("error", {}).get("code") == -32602, str(bad)[:120])
     check("J-8 同时列出 grade 与 topic", {"/grade", "/topic"} <= pointers, str(pointers))
 
+    blocked = client.call(
+        "generate_teaching_package",
+        {"grade": "七年级", "subject": "数学", "topic": "联系电话：13800138000"},
+    )["result"]
+    blocked_payload = blocked.get("structuredContent", {}).get("error", {})
+    check("高风险课题通过 MCP 返回业务拦截",
+          blocked.get("isError") is True and blocked_payload.get("code") == "CONTENT_BLOCKED",
+          str(blocked)[:180])
+    check("MCP 拦截报告不回显敏感号码",
+          "13800138000" not in json.dumps(blocked, ensure_ascii=False)
+          and blocked_payload.get("content_review", {}).get("status") == "blocked")
+
     # J-14 路径穿越：直接往库里塞一条越界路径
     from xhzh import storage
 
